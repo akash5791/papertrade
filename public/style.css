@@ -189,3 +189,34 @@ html, body { height: 100%; background: var(--bg); color: var(--text); font-famil
   .nav { padding: 0 12px; }
   .content-panel { padding: 12px; }
 }
+
+/* ── Watchlist grid cards ── */
+.wl-card {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.wl-card:hover { background: var(--bg4); border-color: var(--border2); }
+.wl-card.wl-active { border-color: var(--blue); background: var(--blue-bg); }
+.wl-sym   { font-size: 11px; font-weight: 600; color: var(--text2); font-family: var(--font-mono); letter-spacing: 0.03em; margin-bottom: 3px; }
+.wl-price { font-size: 14px; font-weight: 600; color: var(--text); font-family: var(--font-mono); }
+.wl-chg   { font-size: 11px; font-family: var(--font-mono); margin-top: 1px; }
+.wl-chg.up { color: var(--green); }
+.wl-chg.dn { color: var(--red); }
+
+/* ── Larger chart wrap ── */
+.chart-wrap {
+  position: relative; width: 100%; height: 280px;
+  background: var(--bg3); border-radius: var(--radius-lg);
+  border: 1px solid var(--border); padding: 16px;
+}
+
+/* ── Stock chart tab layout ── */
+.stock-header {
+  display: flex; align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px; flex-wrap: wrap; gap: 8px;
+}
