@@ -1,0 +1,1075 @@
+'use strict';
+
+/* ══════════════════════════════════════════════════════
+   CONSTANTS & INSTRUMENT MASTER
+══════════════════════════════════════════════════════ */
+const SK              = 'papertrade_v6';
+const INIT_NSE_BAL    = 500000;
+const INIT_CRYPTO_BAL = 10000;
+
+const NSE_SYMS = [
+  'RELIANCE','TCS','INFY','HDFCBANK','ICICIBANK','WIPRO','SBIN',
+  'LT','BAJFINANCE','HCLTECH','MARUTI','ASIANPAINT','KOTAKBANK',
+  'AXISBANK','TITAN','ONGC','NTPC','POWERGRID','ADANIENT','ADANIPORTS'
+];
+const CRYPTO_SYMS = [
+  'BTC','ETH','SOL','BNB','XRP','DOGE','ADA','AVAX','DOT','MATIC',
+  'LINK','UNI','ATOM','LTC','BCH'
+];
+const INDEX_SYMS = ['NIFTY 50','BANKNIFTY','FINNIFTY'];
+
+/* Angel One NSE tokens — indices on NSE segment */
+const ANGEL_TOKENS = {
+  'NIFTY 50' :'26000', 'BANKNIFTY':'26009', 'FINNIFTY' :'26037',
+  'RELIANCE' :'2885',  'TCS'      :'11536', 'INFY'     :'1594',
+  'HDFCBANK' :'1333',  'ICICIBANK':'4963',  'WIPRO'    :'3787',
+  'SBIN'     :'3045',  'LT'       :'11483', 'BAJFINANCE':'317',
+  'HCLTECH'  :'7229',  'MARUTI'   :'10999', 'ASIANPAINT':'236',
+  'KOTAKBANK':'1922',  'AXISBANK' :'5900',  'TITAN'    :'3506',
+  'ONGC'     :'2475',  'NTPC'     :'11630', 'POWERGRID':'14977',
+  'ADANIENT' :'25',    'ADANIPORTS':'15083'
+};
+const TOKEN_TO_SYM = Object.fromEntries(Object.entries(ANGEL_TOKENS).map(([s,t])=>[t,s]));
+
+/* Lot sizes */
+const LOT_SIZE = { 'NIFTY 50':75, 'BANKNIFTY':30, 'FINNIFTY':40 };
+
+/* Simulated base prices (realistic Jun 2026 approx) */
+const BASE = {
+  /* NSE indices */
+  'NIFTY 50':23200, 'BANKNIFTY':50200, 'FINNIFTY':22000,
+  /* NSE equity */
+  'RELIANCE':2750,'TCS':4050,'INFY':1780,'HDFCBANK':1620,'ICICIBANK':1280,
+  'WIPRO':460,'SBIN':790,'LT':3500,'BAJFINANCE':6900,'HCLTECH':1880,
+  'MARUTI':12200,'ASIANPAINT':2750,'KOTAKBANK':1750,'AXISBANK':1100,'TITAN':3300,
+  'ONGC':275,'NTPC':345,'POWERGRID':305,'ADANIENT':2500,'ADANIPORTS':1350,
+  /* Crypto USD */
+  'BTC':67000,'ETH':3500,'SOL':185,'BNB':580,'XRP':0.62,
+  'DOGE':0.18,'ADA':0.55,'AVAX':38,'DOT':8.5,'MATIC':0.9,
+  'LINK':18,'UNI':12,'ATOM':10,'LTC':88,'BCH':480
+};
+
+/* ══════════════════════════════════════════════════════
+   STATE
+══════════════════════════════════════════════════════ */
+function freshState() {
+  return {
+    nse:    { balance:INIT_NSE_BAL,    trades:[], history:[], pnlHist:[], apiCfg:null },
+    crypto: { balance:INIT_CRYPTO_BAL, trades:[], history:[], pnlHist:[] }
+  };
+}
+function loadState() {
+  try { const r=localStorage.getItem(SK); if(r) return JSON.parse(r); } catch(e){}
+  return freshState();
+}
+function save() { try { localStorage.setItem(SK,JSON.stringify(S)); } catch(e){} }
+
+let S           = loadState();
+let mode        = 'nse';
+let activeTab   = 'positions';   /* positions | history | prices | pnlchart | optchain */
+let tradeMode   = 'equity';      /* equity | options  (nse only) */
+let side        = 'buy';
+let optType     = 'CE';
+let authToken   = null;
+let isLive      = false;
+
+/* price state */
+let liveQ       = {};   /* key -> ltp.  key = sym OR angel token OR option label */
+let sessionOpen = {};   /* sym -> first price of session */
+let priceHist   = {};   /* sym -> [{t,p}] */
+
+/* option chain state */
+let ocIndex     = 'NIFTY 50';
+let ocExpiry    = null;
+let ocChain     = {};   /* strike -> {CE:{ltp,oi,vol}, PE:{ltp,oi,vol}} */
+
+/* chart state */
+let selectedSym = 'NIFTY 50';
+let chartRange  = '15m';
+let pnlChart    = null;
+let stockChart  = null;
+
+let tickTimer   = null;
+
+/* ══════════════════════════════════════════════════════
+   FORMATTING
+══════════════════════════════════════════════════════ */
+const fmtINR = (n,dp=2) => (n<0?'-₹':'₹')+Math.abs(n).toLocaleString('en-IN',{minimumFractionDigits:dp,maximumFractionDigits:dp});
+const fmtUSD = (n,dp=2) => (n<0?'-$':'$')+Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:dp,maximumFractionDigits:dp});
+const fmt    = (n,m,dp) => m==='nse' ? fmtINR(n,dp??2) : fmtUSD(n,dp??(n<10?4:2));
+const fmtPct = n => (n>=0?'+':'')+n.toFixed(2)+'%';
+const today  = () => new Date().toLocaleDateString('en-IN',{day:'numeric',month:'short',year:'2-digit'});
+const nowT   = () => new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit',second:'2-digit'});
+
+/* ══════════════════════════════════════════════════════
+   PRICE ENGINE
+══════════════════════════════════════════════════════ */
+function initPrices() {
+  Object.entries(BASE).forEach(([k,v]) => { if(!liveQ[k]) liveQ[k]=v; });
+  /* also init by angel token for indices */
+  Object.entries(ANGEL_TOKENS).forEach(([sym,tok]) => {
+    if(!liveQ[tok] && BASE[sym]) liveQ[tok] = BASE[sym];
+  });
+}
+
+function getLTP(key) {
+  /* key may be: symbol name | angel token | option label */
+  if (liveQ[key] !== undefined) return liveQ[key];
+  const tok = ANGEL_TOKENS[key];
+  if (tok && liveQ[tok] !== undefined) return liveQ[tok];
+  return BASE[key] ?? 0;
+}
+
+function tickSimulated() {
+  /* tick all known symbols */
+  const allKeys = [...new Set([...Object.keys(BASE), ...Object.keys(liveQ)])];
+  allKeys.forEach(k => {
+    const base = BASE[k] ?? liveQ[k] ?? 1;
+    const vol  = base<5?0.008:base<200?0.002:0.0012;
+    liveQ[k] = Math.max(0.001, (liveQ[k]??base) + (Math.random()-0.495)*base*vol);
+    /* keep token and symbol in sync */
+    const sym = TOKEN_TO_SYM[k];
+    if (sym) liveQ[sym] = liveQ[k];
+    const tok = ANGEL_TOKENS[k];
+    if (tok) liveQ[tok] = liveQ[k];
+  });
+  /* simulate option chain prices based on index move */
+  tickOptionChain();
+}
+
+function tickOptionChain() {
+  /* For each open options trade, simulate premium movement based on underlying */
+  S.nse.trades.filter(t=>t.type==='options').forEach(t => {
+    const underlying = getLTP(t.underlying || 'NIFTY 50');
+    const strike     = t.strike || 0;
+    const optT       = t.optType || 'CE';
+    const intrinsic  = optT==='CE' ? Math.max(0, underlying-strike) : Math.max(0, strike-underlying);
+    const timeVal    = (liveQ[t.token] ?? t.price) * 0.3 * (Math.random()*0.04+0.98);
+    const newPrem    = Math.max(0.05, intrinsic * 1.05 + timeVal);
+    liveQ[t.token]  = parseFloat(newPrem.toFixed(2));
+  });
+  /* Also simulate ocChain strikes */
+  const spot = getLTP(ocIndex);
+  Object.entries(ocChain).forEach(([strike,data]) => {
+    const s = parseInt(strike);
+    const diff = (Math.random()-0.495)*spot*0.0008;
+    ['CE','PE'].forEach(ot => {
+      if (!data[ot]) return;
+      const intr = ot==='CE' ? Math.max(0,spot-s) : Math.max(0,s-spot);
+      const tv   = data[ot].ltp * 0.25 * (Math.random()*0.06+0.97);
+      data[ot].ltp = Math.max(0.05, parseFloat((intr*1.05+tv).toFixed(2)));
+    });
+  });
+}
+
+function recordHistory() {
+  const allSyms = [...INDEX_SYMS, ...NSE_SYMS, ...CRYPTO_SYMS];
+  const t = nowT();
+  allSyms.forEach(sym => {
+    const p = getLTP(sym);
+    if (!p) return;
+    if (!sessionOpen[sym]) sessionOpen[sym] = p;
+    if (!priceHist[sym]) priceHist[sym] = [];
+    priceHist[sym].push({t,p});
+    if (priceHist[sym].length > 200) priceHist[sym].shift();
+  });
+}
+
+/* ══════════════════════════════════════════════════════
+   ANGEL ONE API
+══════════════════════════════════════════════════════ */
+async function loginAngelOne(cfg) {
+  try {
+    const res = await fetch('https://apiconnect.angelbroking.com/rest/auth/angelbroking/user/v1/loginByPassword',{
+      method:'POST',
+      headers:{
+        'Content-Type':'application/json','Accept':'application/json',
+        'X-UserType':'USER','X-SourceID':'WEB',
+        'X-ClientLocalIP':'192.168.1.1','X-ClientPublicIP':'192.168.1.1',
+        'X-MACAddress':'00:00:00:00:00:00','X-PrivateKey':cfg.apiKey
+      },
+      body:JSON.stringify({clientcode:cfg.clientId, password:cfg.mpin, totp:cfg.totp})
+    });
+    const data = await res.json();
+    if (data.status && data.data?.jwtToken) {
+      authToken=data.data.jwtToken; isLive=true; S.nse.apiCfg=cfg; save();
+      return {ok:true};
+    }
+    return {ok:false, msg:data.message||'Login failed'};
+  } catch(e) { return {ok:false, msg:'Network error: '+e.message}; }
+}
+
+async function fetchLiveQuotes() {
+  if (!authToken || !S.nse.apiCfg) return;
+  /* All NSE tokens: indices + equities */
+  const nseTokens = [...new Set(Object.values(ANGEL_TOKENS))];
+  /* NFO tokens from open option trades */
+  const nfoTokens = S.nse.trades.filter(t=>t.type==='options'&&t.nfoToken).map(t=>t.nfoToken);
+  const exTokens  = {NSE: nseTokens};
+  if (nfoTokens.length) exTokens.NFO = nfoTokens;
+  try {
+    const res = await fetch('https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/quote/',{
+      method:'POST',
+      headers:{
+        'Content-Type':'application/json','Accept':'application/json',
+        'Authorization':'Bearer '+authToken,
+        'X-UserType':'USER','X-SourceID':'WEB',
+        'X-ClientLocalIP':'192.168.1.1','X-ClientPublicIP':'192.168.1.1',
+        'X-MACAddress':'00:00:00:00:00:00',
+        'X-PrivateKey':S.nse.apiCfg.apiKey
+      },
+      body:JSON.stringify({mode:'LTP', exchangeTokens:exTokens})
+    });
+    const data = await res.json();
+    if (data.status && data.data?.fetched) {
+      data.data.fetched.forEach(q => {
+        const tok = String(q.symbolToken);
+        const ltp = parseFloat(q.ltp);
+        if (!ltp||isNaN(ltp)) return;
+        liveQ[tok] = ltp;
+        const sym = TOKEN_TO_SYM[tok];
+        if (sym) liveQ[sym] = ltp;
+      });
+    }
+  } catch(e) { console.warn('fetchLiveQuotes:', e.message); }
+}
+
+/* Option chain from Angel One (NFO segment) */
+async function fetchOptionChain(index, expiry) {
+  if (!authToken || !S.nse.apiCfg) return null;
+  try {
+    const res = await fetch(`https://apiconnect.angelbroking.com/rest/secure/angelbroking/market/v1/optionChain?name=${encodeURIComponent(index)}&expirydate=${encodeURIComponent(expiry)}&pe=true&ce=true`,{
+      headers:{
+        'Authorization':'Bearer '+authToken,
+        'X-UserType':'USER','X-SourceID':'WEB',
+        'X-ClientLocalIP':'192.168.1.1','X-ClientPublicIP':'192.168.1.1',
+        'X-MACAddress':'00:00:00:00:00:00',
+        'X-PrivateKey':S.nse.apiCfg.apiKey
+      }
+    });
+    const data = await res.json();
+    if (data.status && data.data) return data.data;
+  } catch(e) { console.warn('fetchOptionChain:', e.message); }
+  return null;
+}
+
+/* ══════════════════════════════════════════════════════
+   SIMULATED OPTION CHAIN BUILDER
+══════════════════════════════════════════════════════ */
+function buildSimulatedChain(index) {
+  const spot    = getLTP(index);
+  const step    = index==='BANKNIFTY' ? 100 : 50;
+  const atm     = Math.round(spot/step)*step;
+  const chain   = {};
+  for (let i=-10; i<=10; i++) {
+    const strike = atm + i*step;
+    const diff   = spot - strike;
+    /* Black-Scholes approximation for simulation */
+    const ceIntr = Math.max(0, diff);
+    const peIntr = Math.max(0, -diff);
+    const timeVal= spot * 0.003 * Math.exp(-Math.abs(diff)/(spot*0.03));
+    chain[strike] = {
+      CE: { ltp: parseFloat((ceIntr*1.02+timeVal+Math.random()*2).toFixed(2)), oi: Math.floor(Math.random()*500000+50000), vol: Math.floor(Math.random()*100000+5000) },
+      PE: { ltp: parseFloat((peIntr*1.02+timeVal+Math.random()*2).toFixed(2)), oi: Math.floor(Math.random()*500000+50000), vol: Math.floor(Math.random()*100000+5000) }
+    };
+  }
+  return chain;
+}
+
+/* ══════════════════════════════════════════════════════
+   MAIN TICK
+══════════════════════════════════════════════════════ */
+async function onTick() {
+  if (isLive && mode==='nse') {
+    await fetchLiveQuotes();
+  } else {
+    tickSimulated();
+  }
+  recordHistory();
+  const tp = totalPnl(mode);
+  S[mode].pnlHist.push({t:nowT(), v:parseFloat(tp.toFixed(2))});
+  if (S[mode].pnlHist.length > 200) S[mode].pnlHist.shift();
+  save();
+  refreshDynamic();
+}
+
+/* ══════════════════════════════════════════════════════
+   P&L
+══════════════════════════════════════════════════════ */
+function tradePnl(t) {
+  const cp   = getLTP(t.token);
+  const diff = (cp - t.price) * t.qty;
+  return t.dir==='short' ? -diff : diff;
+}
+function totalPnl(m) { return (S[m].trades||[]).reduce((a,t)=>a+tradePnl(t),0); }
+function portVal(m)  { return (S[m].trades||[]).reduce((a,t)=>a+getLTP(t.token)*t.qty,0); }
+
+/* ══════════════════════════════════════════════════════
+   PARTIAL DOM REFRESH
+══════════════════════════════════════════════════════ */
+function refreshDynamic() {
+  const tp=totalPnl(mode), pv=portVal(mode);
+  const init=mode==='nse'?INIT_NSE_BAL:INIT_CRYPTO_BAL;
+  const total=S[mode].balance+pv;
+  const ret=((total-init)/init)*100;
+
+  const me=document.getElementById('metrics-area');
+  if(me) me.innerHTML=metricsHTML(tp,total,ret);
+
+  const tb=document.getElementById('ticker-area');
+  if(tb) tb.innerHTML=tickerHTML();
+
+  if(activeTab==='positions'){
+    const pt=document.getElementById('pos-table');
+    if(pt) pt.innerHTML=posTableHTML();
+  }
+  if(activeTab==='pnlchart')  updatePnlChart();
+  if(activeTab==='prices')   { updateStockChart(); updateWatchlist(); }
+  if(activeTab==='optchain')  updateOCPrices();
+
+  /* update LTP in order form */
+  refreshOrderLTP();
+}
+
+function refreshOrderLTP() {
+  const ltpEl = document.getElementById('o-ltp');
+  if (!ltpEl) return;
+  const sym = getOrderSym();
+  if (!sym) return;
+  const p = getLTP(sym);
+  if (p) ltpEl.textContent = fmt(p,'nse');
+}
+
+function getOrderSym() {
+  const el = document.getElementById('o-sym');
+  if (!el) return null;
+  if (el.value==='__custom__') return document.getElementById('o-custom')?.value?.trim().toUpperCase()||null;
+  return el.value||null;
+}
+
+/* ══════════════════════════════════════════════════════
+   HTML BUILDERS — TICKER
+══════════════════════════════════════════════════════ */
+function tickerHTML() {
+  const items = mode==='nse'
+    ? [{n:'NIFTY 50',k:'NIFTY 50'},{n:'BANKNIFTY',k:'BANKNIFTY'},{n:'FINNIFTY',k:'FINNIFTY'}]
+    : [{n:'BTC',k:'BTC'},{n:'ETH',k:'ETH'},{n:'SOL',k:'SOL'},{n:'BNB',k:'BNB'}];
+  return items.map(it=>{
+    const p=getLTP(it.k), open=sessionOpen[it.k]||p;
+    const chg=open?((p-open)/open)*100:0;
+    const dp=mode==='nse'?2:(p<10?4:2);
+    return `<div class="ticker-item" onclick="goStockChart('${it.k}')" style="cursor:pointer" title="View chart">
+      <span class="ticker-name">${it.n}</span>
+      <span class="ticker-price">${fmt(p,mode,dp)}</span>
+      <span class="ticker-chg ${chg>=0?'up':'dn'}">${fmtPct(chg)}</span>
+    </div>`;
+  }).join('');
+}
+
+function metricsHTML(tp,total,ret) {
+  return `
+    <div class="metric"><div class="metric-label">Total assets</div><div class="metric-val">${fmt(total,mode)}</div></div>
+    <div class="metric"><div class="metric-label">Unrealised P&L</div><div class="metric-val ${tp>=0?'pos':'neg'}">${fmt(tp,mode)}</div></div>
+    <div class="metric"><div class="metric-label">Return</div><div class="metric-val ${ret>=0?'pos':'neg'}">${fmtPct(ret)}</div></div>
+    <div class="metric"><div class="metric-label">Open positions</div><div class="metric-val">${S[mode].trades.length}</div></div>`;
+}
+
+/* ══════════════════════════════════════════════════════
+   HTML BUILDERS — POSITIONS
+══════════════════════════════════════════════════════ */
+function posTableHTML() {
+  const trades=S[mode].trades;
+  if(!trades.length) return `<div class="empty"><div class="empty-icon">📭</div><strong>No open positions</strong><p>Use the order form →</p></div>`;
+  return `<table class="tbl">
+    <thead><tr><th>Symbol</th><th>Type</th><th>Side</th><th>Qty</th><th>Entry</th><th>LTP</th><th>P&L</th><th></th></tr></thead>
+    <tbody>${trades.map((t,i)=>{
+      const ltp=getLTP(t.token);
+      const p=tradePnl(t);
+      const pct=t.price?((ltp-t.price)/t.price)*100:0;
+      return `<tr>
+        <td><span class="sym-cell" title="${t.sym}">${t.sym}</span>${t.optType?` <span class="badge badge-${t.optType.toLowerCase()}">${t.optType}</span>`:''}</td>
+        <td><span class="badge ${t.type==='options'?'badge-opt':'badge-eq'}">${t.type}</span></td>
+        <td><span class="badge badge-${t.dir}">${t.dir}</span></td>
+        <td class="num-cell">${t.qty}</td>
+        <td class="num-cell">${fmt(t.price,mode)}</td>
+        <td class="num-cell" style="color:${ltp>=t.price?'var(--green)':'var(--red)'}">${fmt(ltp,mode)}</td>
+        <td class="num-cell" style="color:${p>=0?'var(--green)':'var(--red)'}">
+          ${fmt(p,mode)}<br><span style="font-size:10px;opacity:.7">${fmtPct(pct)}</span>
+        </td>
+        <td><button class="xbtn" onclick="closeTrade(${i})" title="Close">✕</button></td>
+      </tr>`;
+    }).join('')}</tbody></table>`;
+}
+
+/* ══════════════════════════════════════════════════════
+   HTML BUILDERS — HISTORY
+══════════════════════════════════════════════════════ */
+function historyHTML() {
+  const h=S[mode].history;
+  if(!h.length) return `<div class="empty"><div class="empty-icon">🕐</div><strong>No closed trades yet</strong></div>`;
+  const rp=h.reduce((a,x)=>a+x.pnl,0);
+  const wins=h.filter(x=>x.pnl>0).length;
+  return `
+    <div class="hist-stats">
+      <div class="hstat"><div class="hstat-label">Realised P&L</div><div class="hstat-val ${rp>=0?'pos':'neg'}">${fmt(rp,mode)}</div></div>
+      <div class="hstat"><div class="hstat-label">Win rate</div><div class="hstat-val">${Math.round(wins/h.length*100)}%</div></div>
+      <div class="hstat"><div class="hstat-label">Trades</div><div class="hstat-val">${h.length}</div></div>
+    </div>
+    <table class="tbl">
+      <thead><tr><th>Symbol</th><th>Type</th><th>Qty</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Date</th></tr></thead>
+      <tbody>${h.map(x=>`<tr>
+        <td class="sym-cell">${x.sym}</td>
+        <td><span class="badge ${x.type==='options'?'badge-opt':'badge-eq'}">${x.type}</span></td>
+        <td class="num-cell">${x.qty}</td>
+        <td class="num-cell">${fmt(x.entry,mode)}</td>
+        <td class="num-cell">${fmt(x.exit,mode)}</td>
+        <td class="num-cell" style="color:${x.pnl>=0?'var(--green)':'var(--red)'};font-weight:600">${fmt(x.pnl,mode)}</td>
+        <td style="color:var(--text3)">${x.date}</td>
+      </tr>`).join('')}</tbody>
+    </table>`;
+}
+
+/* ══════════════════════════════════════════════════════
+   HTML BUILDERS — LIVE PRICES TAB
+══════════════════════════════════════════════════════ */
+function pricesTabHTML() {
+  const syms = mode==='nse' ? [...INDEX_SYMS,...NSE_SYMS] : CRYPTO_SYMS;
+  const p=getLTP(selectedSym), open=sessionOpen[selectedSym]||p;
+  const chg=open?((p-open)/open)*100:0;
+  return `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <select id="stock-sel" onchange="goStockChart(this.value)"
+          style="font-size:13px;padding:5px 10px;background:var(--bg3);color:var(--text);border:1px solid var(--border);border-radius:6px">
+          ${syms.map(s=>`<option value="${s}" ${s===selectedSym?'selected':''}>${s}</option>`).join('')}
+        </select>
+        <span id="sc-price" style="font-size:22px;font-weight:600;font-family:var(--font-mono);color:var(--text)">${fmt(p,mode)}</span>
+        <span id="sc-chg"   style="font-size:13px;font-family:var(--font-mono);color:${chg>=0?'var(--green)':'var(--red)'}">${fmtPct(chg)}</span>
+      </div>
+      <div style="display:flex;gap:4px" id="range-btns">
+        ${['15m','30m','All'].map((r,i)=>`<button class="seg-btn ${chartRange===(r==='All'?'all':r)?'active':''}" onclick="setRange(this,'${r==='All'?'all':r}')">${r}</button>`).join('')}
+      </div>
+    </div>
+    <div class="chart-wrap" style="height:250px;margin-bottom:16px">
+      <canvas id="stockCanvas" role="img" aria-label="Price chart for ${selectedSym}"></canvas>
+    </div>
+    <div class="sec-title">All ${mode==='nse'?'NSE':'Crypto'} prices</div>
+    <div id="wl-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:6px">
+      ${watchlistHTML(syms)}
+    </div>`;
+}
+
+function watchlistHTML(syms) {
+  return syms.map(sym=>{
+    const p=getLTP(sym), open=sessionOpen[sym]||p;
+    const chg=open?((p-open)/open)*100:0;
+    const dp=(mode==='crypto'&&p<10)?4:2;
+    return `<div class="wl-card ${sym===selectedSym?'wl-active':''}" onclick="goStockChart('${sym}')">
+      <div class="wl-sym">${sym}</div>
+      <div class="wl-price">${fmt(p,mode,dp)}</div>
+      <div class="wl-chg ${chg>=0?'up':'dn'}">${fmtPct(chg)}</div>
+    </div>`;
+  }).join('');
+}
+
+function updateWatchlist() {
+  const syms = mode==='nse'?[...INDEX_SYMS,...NSE_SYMS]:CRYPTO_SYMS;
+  const wg=document.getElementById('wl-grid');
+  if(wg) wg.innerHTML=watchlistHTML(syms);
+  const p=getLTP(selectedSym), open=sessionOpen[selectedSym]||p;
+  const chg=open?((p-open)/open)*100:0;
+  const sp=document.getElementById('sc-price'); if(sp) sp.textContent=fmt(p,mode);
+  const sc=document.getElementById('sc-chg');
+  if(sc){ sc.textContent=fmtPct(chg); sc.style.color=chg>=0?'var(--green)':'var(--red)'; }
+}
+
+/* ══════════════════════════════════════════════════════
+   HTML BUILDERS — OPTION CHAIN
+══════════════════════════════════════════════════════ */
+function getExpiries() {
+  const expiries=[];
+  const d=new Date();
+  /* next 4 weekly Thursdays */
+  for(let i=0;i<4;i++){
+    const nd=new Date(d);
+    nd.setDate(d.getDate()+((4-d.getDay()+7)%7||7)+i*7);
+    expiries.push(nd.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'2-digit'}));
+  }
+  /* monthly expiry (last Thursday of month) */
+  const lte=new Date(d.getFullYear(),d.getMonth()+1,0);
+  while(lte.getDay()!==4) lte.setDate(lte.getDate()-1);
+  expiries.push(lte.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'2-digit'}));
+  return [...new Set(expiries)];
+}
+
+function optChainTabHTML() {
+  const expiries=getExpiries();
+  if(!ocExpiry) ocExpiry=expiries[0];
+  const spot=getLTP(ocIndex);
+  const step=ocIndex==='BANKNIFTY'?100:50;
+  const atm=Math.round(spot/step)*step;
+
+  /* build chain if empty */
+  if(!Object.keys(ocChain).length) ocChain=buildSimulatedChain(ocIndex);
+
+  const strikes=Object.keys(ocChain).map(Number).sort((a,b)=>a-b);
+
+  return `
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px">
+      <div class="seg-row">
+        ${INDEX_SYMS.map(s=>`<button class="seg-btn ${ocIndex===s?'active':''}" onclick="setOCIndex('${s}')">${s}</button>`).join('')}
+      </div>
+      <select id="oc-expiry" onchange="setOCExpiry(this.value)"
+        style="font-size:12px;padding:5px 9px;background:var(--bg3);color:var(--text);border:1px solid var(--border);border-radius:6px">
+        ${expiries.map(e=>`<option value="${e}" ${e===ocExpiry?'selected':''}>${e}</option>`).join('')}
+      </select>
+      <span style="font-size:12px;color:var(--text2)">Spot: <strong style="font-family:var(--font-mono);color:var(--text)">${fmtINR(spot)}</strong></span>
+      <span style="font-size:11px;color:var(--text3)">ATM: <strong style="color:var(--amber)">${atm}</strong></span>
+      ${!isLive?`<span style="font-size:10px;color:var(--text3);background:var(--bg4);padding:2px 8px;border-radius:4px">Simulated</span>`:''}
+    </div>
+    <div style="overflow-x:auto">
+    <table class="tbl" style="min-width:640px">
+      <thead>
+        <tr style="background:var(--bg3)">
+          <th colspan="4" style="text-align:center;color:var(--green);background:rgba(0,200,150,0.05)">── CALLS (CE) ──</th>
+          <th style="text-align:center;background:var(--bg4);color:var(--amber)">STRIKE</th>
+          <th colspan="4" style="text-align:center;color:var(--red);background:rgba(255,79,94,0.05)">── PUTS (PE) ──</th>
+        </tr>
+        <tr>
+          <th style="background:rgba(0,200,150,0.05)">OI</th>
+          <th style="background:rgba(0,200,150,0.05)">Vol</th>
+          <th style="background:rgba(0,200,150,0.05)">LTP</th>
+          <th style="background:rgba(0,200,150,0.05)">Buy</th>
+          <th style="text-align:center;background:var(--bg4)">Strike</th>
+          <th style="background:rgba(255,79,94,0.05)">Buy</th>
+          <th style="background:rgba(255,79,94,0.05)">LTP</th>
+          <th style="background:rgba(255,79,94,0.05)">Vol</th>
+          <th style="background:rgba(255,79,94,0.05)">OI</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${strikes.map(strike=>{
+          const row=ocChain[strike];
+          if(!row) return '';
+          const ce=row.CE||{ltp:0,oi:0,vol:0};
+          const pe=row.PE||{ltp:0,oi:0,vol:0};
+          const isATM=strike===atm;
+          const itmCE=spot>strike, itmPE=spot<strike;
+          return `<tr style="${isATM?'outline:1px solid var(--amber);':''}${itmCE?'background:rgba(0,200,150,0.03)':''}">
+            <td class="num-cell" style="font-size:11px;background:rgba(0,200,150,0.03)">${(ce.oi/1000).toFixed(0)}K</td>
+            <td class="num-cell" style="font-size:11px;background:rgba(0,200,150,0.03)">${(ce.vol/1000).toFixed(0)}K</td>
+            <td class="num-cell" id="oc-ce-${strike}" style="color:var(--green);font-weight:500;background:rgba(0,200,150,0.05)">${fmtINR(ce.ltp)}</td>
+            <td style="background:rgba(0,200,150,0.03)">
+              <button class="oc-buy-btn" onclick="buyFromChain(${strike},'CE')" title="Buy ${strike} CE">B</button>
+              <button class="oc-sell-btn" onclick="sellFromChain(${strike},'CE')" title="Sell ${strike} CE">S</button>
+            </td>
+            <td class="num-cell" style="text-align:center;font-weight:700;font-size:13px;background:var(--bg4);color:${isATM?'var(--amber)':'var(--text)'}">${strike}</td>
+            <td style="background:rgba(255,79,94,0.03)">
+              <button class="oc-buy-btn" onclick="buyFromChain(${strike},'PE')" title="Buy ${strike} PE">B</button>
+              <button class="oc-sell-btn" onclick="sellFromChain(${strike},'PE')" title="Sell ${strike} PE">S</button>
+            </td>
+            <td class="num-cell" id="oc-pe-${strike}" style="color:var(--red);font-weight:500;background:rgba(255,79,94,0.05)">${fmtINR(pe.ltp)}</td>
+            <td class="num-cell" style="font-size:11px;background:rgba(255,79,94,0.03)">${(pe.vol/1000).toFixed(0)}K</td>
+            <td class="num-cell" style="font-size:11px;background:rgba(255,79,94,0.03)">${(pe.oi/1000).toFixed(0)}K</td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table></div>`;
+}
+
+function updateOCPrices() {
+  if(!Object.keys(ocChain).length) return;
+  Object.entries(ocChain).forEach(([strike,row])=>{
+    const ce=document.getElementById(`oc-ce-${strike}`);
+    const pe=document.getElementById(`oc-pe-${strike}`);
+    if(ce&&row.CE) ce.textContent=fmtINR(row.CE.ltp);
+    if(pe&&row.PE) pe.textContent=fmtINR(row.PE.ltp);
+  });
+}
+
+/* ══════════════════════════════════════════════════════
+   HTML BUILDERS — ORDER FORM
+══════════════════════════════════════════════════════ */
+function orderFormHTML() {
+  const isNse=mode==='nse', isOpt=tradeMode==='options';
+  const syms=isNse?NSE_SYMS:CRYPTO_SYMS;
+  const expiries=getExpiries();
+  const lotSz=LOT_SIZE[ocIndex]||75;
+
+  return `
+    <div class="sec-title">Order</div>
+    ${isNse?`<div class="seg-row" style="margin-bottom:6px">
+      <button class="seg-btn ${tradeMode==='equity'?'active':''}" onclick="setTradeMode('equity')">Equity</button>
+      <button class="seg-btn ${tradeMode==='options'?'active':''}" onclick="setTradeMode('options')">F&amp;O</button>
+      <button class="seg-btn ${activeTab==='optchain'?'active':''}" onclick="setTab('optchain')">⛓ Option chain</button>
+    </div>`:''}
+    <div class="side-toggle">
+      <button class="stab ${side==='buy'?'active-buy':''}" onclick="setSide('buy')">▲ Buy</button>
+      <button class="stab ${side==='sell'?'active-sell':''}" onclick="setSide('sell')">▼ Sell</button>
+    </div>
+
+    ${isOpt ? `
+      <div class="form-group">
+        <label class="form-label">Index</label>
+        <select id="o-sym" onchange="onOptSymChange(this)">
+          ${INDEX_SYMS.map(s=>`<option value="${s}" ${s===ocIndex?'selected':''}>${s}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Expiry</label>
+        <select id="o-expiry">${expiries.map(e=>`<option value="${e}">${e}</option>`).join('')}</select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Strike price (₹)</label>
+        <input id="o-strike" type="number" step="50" placeholder="e.g. ${Math.round(getLTP(ocIndex)/50)*50}" oninput="lookupOptionLTP()" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Option type</label>
+        <div class="seg-row">
+          <button class="seg-btn ${optType==='CE'?'active-ce':''}" onclick="setOptType('CE')" style="flex:1;text-align:center">CE — Call</button>
+          <button class="seg-btn ${optType==='PE'?'active-pe':''}" onclick="setOptType('PE')" style="flex:1;text-align:center">PE — Put</button>
+        </div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">LTP (estimated)</label>
+        <div id="o-ltp" style="font-size:14px;font-weight:600;font-family:var(--font-mono);color:var(--green);padding:3px 0">—</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Premium ₹/unit</label>
+        <input id="o-price" type="number" step="0.05" placeholder="0.00" oninput="calcTotal()" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">Lots &nbsp;<span style="color:var(--text3);font-weight:400">(1 lot = ${lotSz} units)</span></label>
+        <input id="o-qty" type="number" step="1" min="1" value="1" oninput="calcTotal()" />
+      </div>
+    ` : `
+      <div class="form-group">
+        <label class="form-label">Symbol</label>
+        <select id="o-sym" onchange="onEquitySymChange(this)">
+          ${syms.map(s=>`<option value="${s}">${s}</option>`).join('')}
+          <option value="__custom__">Custom…</option>
+        </select>
+      </div>
+      <div class="form-group" id="custom-wrap" style="display:none">
+        <label class="form-label">Custom symbol</label>
+        <input id="o-custom" type="text" placeholder="${isNse?'e.g. ONGC':'e.g. PEPE'}" oninput="onCustomInput()" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">LTP</label>
+        <div id="o-ltp" style="font-size:14px;font-weight:600;font-family:var(--font-mono);color:var(--green);padding:3px 0">—</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Price (${isNse?'₹':'$'})</label>
+        <input id="o-price" type="number" step="${isNse?'0.05':'0.0001'}" placeholder="0.00" oninput="calcTotal()" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">${isNse?'Qty (shares)':'Qty (units)'}</label>
+        <input id="o-qty" type="number" step="${isNse?'1':'0.0001'}" placeholder="${isNse?'10':'0.1'}" oninput="calcTotal()" />
+      </div>
+    `}
+
+    <div class="total-line" id="o-total"></div>
+    <button class="${side==='buy'?'btn-buy':'btn-sell'}" onclick="placeOrder()">
+      ${side==='buy'?'▲ Buy':'▼ Sell'} ${isOpt?'Option':isNse?'Shares':'Crypto'}
+    </button>
+    <div class="err-msg" id="o-err"></div>
+    <div class="divider"></div>
+    <button class="btn-reset" onclick="doReset()">↺ Reset ${mode==='nse'?'NSE':'Crypto'}</button>
+  `;
+}
+
+/* ══════════════════════════════════════════════════════
+   FULL RENDER
+══════════════════════════════════════════════════════ */
+function render() {
+  const tp=totalPnl(mode), pv=portVal(mode);
+  const init=mode==='nse'?INIT_NSE_BAL:INIT_CRYPTO_BAL;
+  const total=S[mode].balance+pv, ret=((total-init)/init)*100;
+
+  document.getElementById('root').innerHTML = `
+    <div class="app">
+      <nav class="nav">
+        <div class="nav-left">
+          <div class="logo">Paper<span>Trade</span></div>
+          <div class="mode-tabs">
+            <button class="mode-tab ${mode==='nse'?'active-nse':''}" onclick="setMode('nse')">🇮🇳 NSE</button>
+            <button class="mode-tab ${mode==='crypto'?'active-crypto':''}" onclick="setMode('crypto')">₿ Crypto</button>
+          </div>
+        </div>
+        <div class="nav-right">
+          <span style="font-size:11px;color:var(--text3)"><span class="${isLive?'dot-live':'dot-sim'}"></span>${isLive?'Live — Angel One':'Simulated'}</span>
+          ${mode==='nse'&&!isLive?`<button class="btn-connect" onclick="showApiModal()">⚡ Connect Angel One</button>`:''}
+          ${mode==='nse'&&isLive?`<span style="font-size:11px;color:var(--green)">✓ Connected</span>`:''}
+          <div class="balance-chip">Cash: <strong>${fmt(S[mode].balance,mode)}</strong></div>
+        </div>
+      </nav>
+
+      <div class="ticker-bar" id="ticker-area">${tickerHTML()}</div>
+      <div class="metrics" id="metrics-area">${metricsHTML(tp,total,ret)}</div>
+
+      <div class="main">
+        <div class="content-panel">
+          <div class="content-tabs">
+            <button class="ctab ${activeTab==='positions'?'active':''}"  onclick="setTab('positions')">Positions</button>
+            <button class="ctab ${activeTab==='history'?'active':''}"    onclick="setTab('history')">History</button>
+            <button class="ctab ${activeTab==='prices'?'active':''}"     onclick="setTab('prices')">📈 Live prices</button>
+            <button class="ctab ${activeTab==='optchain'?'active':''}"   onclick="setTab('optchain')">⛓ Option chain</button>
+            <button class="ctab ${activeTab==='pnlchart'?'active':''}"   onclick="setTab('pnlchart')">P&L chart</button>
+          </div>
+          ${activeTab==='positions' ? `<div id="pos-table">${posTableHTML()}</div>` : ''}
+          ${activeTab==='history'   ? historyHTML()      : ''}
+          ${activeTab==='prices'    ? pricesTabHTML()    : ''}
+          ${activeTab==='optchain'  ? optChainTabHTML()  : ''}
+          ${activeTab==='pnlchart'  ? `<div class="sec-title">Portfolio P&L — session</div><div class="chart-wrap"><canvas id="pnlCanvas"></canvas></div>` : ''}
+        </div>
+        <div class="side-panel" id="order-form">${orderFormHTML()}</div>
+      </div>
+    </div>`;
+
+  if(activeTab==='pnlchart')  setTimeout(initPnlChart,60);
+  if(activeTab==='prices')    setTimeout(initStockChart,60);
+  /* init option chain */
+  if(activeTab==='optchain' && !Object.keys(ocChain).length) {
+    ocChain = buildSimulatedChain(ocIndex);
+  }
+  /* fill order form LTP */
+  setTimeout(()=>{ fillOrderLTP(); calcTotal(); }, 50);
+}
+
+/* ══════════════════════════════════════════════════════
+   CHARTS
+══════════════════════════════════════════════════════ */
+function initPnlChart() {
+  const cv=document.getElementById('pnlCanvas'); if(!cv) return;
+  if(pnlChart){pnlChart.destroy();pnlChart=null;}
+  const hist=S[mode].pnlHist;
+  const last=hist[hist.length-1]?.v??0;
+  pnlChart=new Chart(cv,{
+    type:'line',
+    data:{ labels:hist.map(p=>p.t), datasets:[{label:'P&L',data:hist.map(p=>p.v),borderColor:last>=0?'#00c896':'#ff4f5e',borderWidth:1.5,pointRadius:0,tension:0.3,fill:false}] },
+    options:{ responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},
+      scales:{ x:{ticks:{font:{size:10,family:'JetBrains Mono'},maxTicksLimit:8,color:'#555d66'},grid:{color:'rgba(255,255,255,0.05)'}},
+               y:{ticks:{font:{size:10,family:'JetBrains Mono'},color:'#555d66',callback:v=>fmt(v,mode,0)},grid:{color:'rgba(255,255,255,0.05)'}} } }
+  });
+}
+function updatePnlChart() {
+  if(!pnlChart) return;
+  const hist=S[mode].pnlHist; const last=hist[hist.length-1]?.v??0;
+  pnlChart.data.labels=hist.map(p=>p.t);
+  pnlChart.data.datasets[0].data=hist.map(p=>p.v);
+  pnlChart.data.datasets[0].borderColor=last>=0?'#00c896':'#ff4f5e';
+  pnlChart.update('none');
+}
+
+function getChartData() {
+  const hist=priceHist[selectedSym]||[];
+  const max=chartRange==='15m'?300:chartRange==='30m'?600:hist.length;
+  return hist.slice(-max);
+}
+function initStockChart() {
+  const cv=document.getElementById('stockCanvas'); if(!cv) return;
+  if(stockChart){stockChart.destroy();stockChart=null;}
+  const data=getChartData();
+  const last=data[data.length-1]?.p??0, first=data[0]?.p??last;
+  stockChart=new Chart(cv,{
+    type:'line',
+    data:{ labels:data.map(d=>d.t), datasets:[{label:selectedSym,data:data.map(d=>d.p),borderColor:last>=first?'#00c896':'#ff4f5e',borderWidth:2,pointRadius:0,tension:0.2,fill:false}] },
+    options:{ responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>fmt(ctx.parsed.y,mode)}}},
+      scales:{ x:{ticks:{font:{size:10,family:'JetBrains Mono'},maxTicksLimit:6,color:'#555d66'},grid:{color:'rgba(255,255,255,0.05)'}},
+               y:{ticks:{font:{size:10,family:'JetBrains Mono'},color:'#555d66',callback:v=>fmt(v,mode,0)},grid:{color:'rgba(255,255,255,0.05)'}} } }
+  });
+}
+function updateStockChart() {
+  if(!stockChart){ initStockChart(); return; }
+  const data=getChartData();
+  const last=data[data.length-1]?.p??0, first=data[0]?.p??last;
+  stockChart.data.labels=data.map(d=>d.t);
+  stockChart.data.datasets[0].data=data.map(d=>d.p);
+  stockChart.data.datasets[0].label=selectedSym;
+  stockChart.data.datasets[0].borderColor=last>=first?'#00c896':'#ff4f5e';
+  stockChart.update('none');
+}
+
+/* ══════════════════════════════════════════════════════
+   ORDER FORM HELPERS
+══════════════════════════════════════════════════════ */
+function fillOrderLTP() {
+  const ltpEl=document.getElementById('o-ltp'); if(!ltpEl) return;
+  const sym=getOrderSym(); if(!sym) return;
+  const p=getLTP(sym);
+  if(p){ ltpEl.textContent=fmt(p,'nse'); }
+}
+
+function lookupOptionLTP() {
+  /* Called when strike or optType changes in options form */
+  const strikeEl=document.getElementById('o-strike');
+  const ltpEl=document.getElementById('o-ltp');
+  const priceEl=document.getElementById('o-price');
+  if(!strikeEl||!ltpEl) return;
+  const strike=parseInt(strikeEl.value);
+  if(!strike) return;
+  /* Look in simulated chain */
+  if(!ocChain[strike]) {
+    /* build a fresh estimate */
+    const spot=getLTP(ocIndex);
+    const step=ocIndex==='BANKNIFTY'?100:50;
+    const intr=optType==='CE'?Math.max(0,spot-strike):Math.max(0,strike-spot);
+    const tv=spot*0.003*Math.exp(-Math.abs(spot-strike)/(spot*0.03));
+    const est=Math.max(0.05, parseFloat((intr*1.02+tv).toFixed(2)));
+    ltpEl.textContent=fmtINR(est);
+    if(priceEl&&!priceEl.value) priceEl.value=est.toFixed(2);
+  } else {
+    const row=ocChain[strike];
+    const ltp=row[optType]?.ltp??0;
+    ltpEl.textContent=fmtINR(ltp);
+    if(priceEl&&!priceEl.value) priceEl.value=ltp.toFixed(2);
+  }
+  calcTotal();
+}
+
+window.onEquitySymChange = function(el) {
+  const cw=document.getElementById('custom-wrap');
+  if(cw) cw.style.display=el.value==='__custom__'?'flex':'none';
+  fillOrderLTP();
+};
+window.onCustomInput = function() { fillOrderLTP(); };
+window.onOptSymChange = function(el) {
+  ocIndex=el.value;
+  ocChain=buildSimulatedChain(ocIndex);
+  lookupOptionLTP();
+};
+
+/* ══════════════════════════════════════════════════════
+   OPTION CHAIN QUICK-BUY
+══════════════════════════════════════════════════════ */
+window.buyFromChain = function(strike, ot) {
+  const ltp=ocChain[strike]?.[ot]?.ltp??0;
+  const lotSz=LOT_SIZE[ocIndex]||75;
+  const label=`${ocIndex} ${strike}${ot} ${ocExpiry}`;
+  const cost=ltp*lotSz;
+  if(cost>S.nse.balance){ alert(`Insufficient funds — need ${fmtINR(cost)}`); return; }
+  liveQ[label]=ltp;
+  S.nse.balance-=cost;
+  S.nse.trades.push({
+    sym:label, type:'options', optType:ot,
+    underlying:ocIndex, strike, price:ltp, qty:lotSz,
+    token:label, dir:'long'
+  });
+  S.nse.pnlHist.push({t:nowT(),v:parseFloat(totalPnl('nse').toFixed(2))});
+  save();
+  alert(`✓ Bought ${label} @ ${fmtINR(ltp)} | Qty: ${lotSz} | Cost: ${fmtINR(cost)}`);
+  if(activeTab==='positions') { const pt=document.getElementById('pos-table'); if(pt) pt.innerHTML=posTableHTML(); }
+  const bal=document.querySelector('.balance-chip strong'); if(bal) bal.textContent=fmtINR(S.nse.balance);
+};
+
+window.sellFromChain = function(strike, ot) {
+  const ltp=ocChain[strike]?.[ot]?.ltp??0;
+  const lotSz=LOT_SIZE[ocIndex]||75;
+  const label=`${ocIndex} ${strike}${ot} ${ocExpiry}`;
+  liveQ[label]=ltp;
+  S.nse.trades.push({
+    sym:label, type:'options', optType:ot,
+    underlying:ocIndex, strike, price:ltp, qty:lotSz,
+    token:label, dir:'short'
+  });
+  S.nse.pnlHist.push({t:nowT(),v:parseFloat(totalPnl('nse').toFixed(2))});
+  save();
+  alert(`✓ Sold ${label} @ ${fmtINR(ltp)} | Qty: ${lotSz}`);
+  if(activeTab==='positions') { const pt=document.getElementById('pos-table'); if(pt) pt.innerHTML=posTableHTML(); }
+};
+
+/* ══════════════════════════════════════════════════════
+   GLOBAL HANDLERS
+══════════════════════════════════════════════════════ */
+window.setMode = function(m) {
+  mode=m; tradeMode='equity'; side='buy'; activeTab='positions';
+  if(stockChart){stockChart.destroy();stockChart=null;}
+  render();
+};
+window.setTab = function(t) {
+  activeTab=t;
+  if(t==='optchain'&&!Object.keys(ocChain).length) ocChain=buildSimulatedChain(ocIndex);
+  render();
+};
+window.setTradeMode = function(m) { tradeMode=m; render(); };
+window.setSide = function(s) {
+  side=s;
+  const of=document.getElementById('order-form'); if(of) of.innerHTML=orderFormHTML();
+  setTimeout(()=>{fillOrderLTP();calcTotal();},30);
+};
+window.setOptType = function(t) {
+  optType=t;
+  const of=document.getElementById('order-form'); if(of) of.innerHTML=orderFormHTML();
+  setTimeout(()=>{lookupOptionLTP();calcTotal();},30);
+};
+window.setOCIndex = function(idx) {
+  ocIndex=idx; ocChain=buildSimulatedChain(idx); render();
+};
+window.setOCExpiry = function(exp) { ocExpiry=exp; };
+window.goStockChart = function(sym) {
+  selectedSym=sym; activeTab='prices'; render();
+};
+window.setRange = function(btn,r) {
+  chartRange=r;
+  document.querySelectorAll('#range-btns .seg-btn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  if(stockChart){stockChart.destroy();stockChart=null;}
+  setTimeout(initStockChart,30);
+};
+window.showApiModal = showApiModal;
+
+window.calcTotal = function() {
+  const p=parseFloat(document.getElementById('o-price')?.value);
+  const q=parseFloat(document.getElementById('o-qty')?.value);
+  const el=document.getElementById('o-total'); if(!el) return;
+  if(p>0&&q>0){
+    const isOpt=tradeMode==='options';
+    const lotSz=isOpt?(LOT_SIZE[ocIndex]||75):1;
+    el.textContent='Order total: '+fmt(p*q*lotSz,mode);
+  } else el.textContent='';
+};
+
+window.placeOrder = function() {
+  const err=document.getElementById('o-err');
+  const isOpt=tradeMode==='options';
+  const price=parseFloat(document.getElementById('o-price')?.value);
+  const qtyRaw=parseFloat(document.getElementById('o-qty')?.value);
+  const lotSz=isOpt?(LOT_SIZE[ocIndex]||75):1;
+  const qty=qtyRaw*lotSz;
+
+  let sym=isOpt
+    ? document.getElementById('o-sym')?.value
+    : (document.getElementById('o-sym')?.value==='__custom__'
+        ? document.getElementById('o-custom')?.value?.trim().toUpperCase()
+        : document.getElementById('o-sym')?.value);
+
+  if(!sym)            {err.textContent='Select a symbol'; return;}
+  if(!price||price<=0){err.textContent='Enter a valid price'; return;}
+  if(!qty||qty<=0)    {err.textContent='Enter valid quantity'; return;}
+
+  const cost=price*qty;
+  if(side==='buy'&&cost>S[mode].balance){err.textContent=`Insufficient funds — need ${fmt(cost,mode)}`; return;}
+
+  let label=sym, token=sym;
+  if(isOpt){
+    const strike=document.getElementById('o-strike')?.value;
+    const expiry=document.getElementById('o-expiry')?.value;
+    if(!strike){err.textContent='Enter strike price'; return;}
+    label=`${sym} ${strike}${optType} ${expiry}`;
+    token=label;
+  }
+
+  if(side==='buy') S[mode].balance-=cost;
+  liveQ[token]=price;
+
+  S[mode].trades.push({
+    sym:label, type:isOpt?'options':'equity',
+    optType:isOpt?optType:null,
+    underlying:isOpt?sym:null,
+    strike:isOpt?parseInt(document.getElementById('o-strike')?.value):null,
+    price, qty, token,
+    dir:side==='buy'?'long':'short'
+  });
+  S[mode].pnlHist.push({t:nowT(),v:parseFloat(totalPnl(mode).toFixed(2))});
+  save(); err.textContent=''; render();
+};
+
+window.closeTrade = function(i) {
+  const t=S[mode].trades[i];
+  const ep=getLTP(t.token);
+  const p=tradePnl(t);
+  S[mode].balance+=ep*t.qty;
+  S[mode].history.unshift({sym:t.sym,type:t.type,qty:t.qty,entry:t.price,exit:ep,pnl:p,dir:t.dir,date:today()});
+  S[mode].trades.splice(i,1);
+  S[mode].pnlHist.push({t:nowT(),v:parseFloat(totalPnl(mode).toFixed(2))});
+  save(); render();
+};
+
+window.doReset = function() {
+  if(confirm(`Reset ${mode.toUpperCase()} portfolio?`)){
+    const cfg=S.nse.apiCfg;
+    S[mode]=mode==='nse'?{balance:INIT_NSE_BAL,trades:[],history:[],pnlHist:[],apiCfg:cfg}:{balance:INIT_CRYPTO_BAL,trades:[],history:[],pnlHist:[]};
+    priceHist={}; sessionOpen={};
+    if(pnlChart){pnlChart.destroy();pnlChart=null;}
+    if(stockChart){stockChart.destroy();stockChart=null;}
+    save(); render();
+  }
+};
+
+/* ══════════════════════════════════════════════════════
+   API MODAL
+══════════════════════════════════════════════════════ */
+function showApiModal() {
+  const ov=document.createElement('div');
+  ov.className='modal-overlay'; ov.id='api-modal';
+  ov.innerHTML=`<div class="modal">
+    <div class="modal-title">Connect Angel One SmartAPI
+      <button class="xbtn" onclick="document.getElementById('api-modal').remove()">✕</button>
+    </div>
+    <div class="modal-hint">API key at <a href="https://smartapi.angelbroking.com" target="_blank">smartapi.angelbroking.com</a><br>
+    TOTP: My Profile → Security → Authenticator → copy secret</div>
+    <div class="modal-grid">
+      <div class="form-group"><label class="form-label">API Key</label><input id="cfg-key" type="text" placeholder="SmartAPI key"/></div>
+      <div class="form-group"><label class="form-label">Client ID</label><input id="cfg-client" type="text" placeholder="A123456"/></div>
+      <div class="form-group"><label class="form-label">MPIN</label><input id="cfg-mpin" type="password" placeholder="4-digit MPIN"/></div>
+      <div class="form-group"><label class="form-label">TOTP (current 6-digit code)</label><input id="cfg-totp" type="text" placeholder="123456" maxlength="6"/></div>
+      <div class="err-msg" id="cfg-err"></div>
+      <div class="modal-actions">
+        <button class="btn-primary" id="cfg-submit" onclick="doLogin()">⚡ Connect &amp; fetch live prices</button>
+        <button class="btn-secondary" onclick="document.getElementById('api-modal').remove()">Use simulated prices</button>
+      </div>
+    </div>
+  </div>`;
+  document.body.appendChild(ov);
+}
+
+window.doLogin = async function() {
+  const btn=document.getElementById('cfg-submit');
+  const err=document.getElementById('cfg-err');
+  const cfg={
+    apiKey:  document.getElementById('cfg-key')?.value?.trim(),
+    clientId:document.getElementById('cfg-client')?.value?.trim(),
+    mpin:    document.getElementById('cfg-mpin')?.value?.trim(),
+    totp:    document.getElementById('cfg-totp')?.value?.trim()
+  };
+  if(!cfg.apiKey||!cfg.clientId||!cfg.mpin||!cfg.totp){err.textContent='All fields required';return;}
+  btn.textContent='Connecting…'; btn.disabled=true;
+  const result=await loginAngelOne(cfg);
+  if(result.ok){
+    btn.textContent='Fetching prices…';
+    await fetchLiveQuotes();
+    recordHistory();
+    document.getElementById('api-modal')?.remove();
+    render();
+  } else {
+    err.textContent=result.msg;
+    btn.textContent='⚡ Connect & fetch live prices';
+    btn.disabled=false;
+  }
+};
+
+/* ══════════════════════════════════════════════════════
+   CSS FOR OPTION CHAIN BUTTONS
+══════════════════════════════════════════════════════ */
+const ocStyle=document.createElement('style');
+ocStyle.textContent=`
+  .oc-buy-btn,.oc-sell-btn{font-size:10px;font-weight:700;padding:2px 6px;border-radius:4px;border:none;cursor:pointer;margin:1px;font-family:var(--font-mono);}
+  .oc-buy-btn{background:var(--green-bg);color:var(--green);}
+  .oc-buy-btn:hover{background:var(--green);color:#000;}
+  .oc-sell-btn{background:var(--red-bg);color:var(--red);}
+  .oc-sell-btn:hover{background:var(--red);color:#fff;}
+`;
+document.head.appendChild(ocStyle);
+
+/* ══════════════════════════════════════════════════════
+   BOOT
+══════════════════════════════════════════════════════ */
+initPrices();
+ocChain = buildSimulatedChain(ocIndex);
+ocExpiry = getExpiries()[0];
+recordHistory();
+
+if(tickTimer) clearInterval(tickTimer);
+tickTimer = setInterval(onTick, 3000);
+
+render();
